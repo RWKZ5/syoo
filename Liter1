@@ -1,0 +1,425 @@
+--!nonstrict
+-- ============================================================
+-- [ Aimbot + Box ESP — V3 Architecture + سكربت 1 tracking ]
+-- ============================================================
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Teams      = game:GetService("Teams")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- ============================================================
+-- [ CONFIG ]
+-- ============================================================
+local Config = {
+    AimbotEnabled   = true,
+    ESPEnabled      = true,
+    BulletSpeed     = 1000,
+    Smoothness      = 0.35,
+    FOV_Radius      = 150,
+}
+
+local FOV_Radius = Config.FOV_Radius
+local BulletSpeed = Config.BulletSpeed
+local Smoothness = Config.Smoothness
+local AimbotEnabled = Config.AimbotEnabled
+
+-- ============================================================
+-- [ UTIL ]
+-- ============================================================
+local function getCamera() return workspace.CurrentCamera end
+local function getScreenCenter()
+    local v = getCamera().ViewportSize
+    return Vector2.new(v.X * 0.5, v.Y * 0.5)
+end
+local function safeDt(dt) return math.max(dt, 1e-4) end
+
+-- ============================================================
+-- [ REGISTRY ]
+-- ============================================================
+local PlayerRegistry = {}
+function PlayerRegistry.track(player, conn)
+    PlayerRegistry[player] = PlayerRegistry[player] or { connections = {} }
+    table.insert(PlayerRegistry[player].connections, conn)
+end
+function PlayerRegistry.clear(player)
+    local e = PlayerRegistry[player]
+    if not e then return end
+    for _, c in ipairs(e.connections) do pcall(function() c:Disconnect() end) end
+    PlayerRegistry[player] = nil
+end
+
+-- ============================================================
+-- [ TEAMS CACHE ]
+-- ============================================================
+local TeamsCache = { hasMulti = false, lastUpdate = 0 }
+local TEAMS_TTL = 1.0
+local function refreshTeamsCache()
+    local now = os.clock()
+    if now - TeamsCache.lastUpdate < TEAMS_TTL then return end
+    TeamsCache.hasMulti = #Teams:GetTeams() > 1
+    TeamsCache.lastUpdate = now
+end
+
+-- ============================================================
+-- [ ✅ منطق الاستهداف من سكربت 1 ]
+-- ============================================================
+local lastVelocities = {}
+
+local function isValidTarget(player)
+    if not player or player == LocalPlayer then return false end
+    local totalTeams = Teams:GetTeams()
+    local hasActiveTeams = #totalTeams > 1
+    if hasActiveTeams and player.Team and LocalPlayer.Team then
+        if player.Team == LocalPlayer.Team then return false end
+    end
+    if hasActiveTeams and player.TeamColor == LocalPlayer.TeamColor then
+        return false
+    end
+    return true
+end
+
+local function isPartVisible(targetPart)
+    if not targetPart then return false end
+    local cam = getCamera()
+    if not cam then return false end
+    local rayOrigin = cam.CFrame.Position
+    local rayDirection = (targetPart.Position - rayOrigin)
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterDescendantsInstances = { LocalPlayer.Character }
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    local raycastResult = workspace:Raycast(rayOrigin, rayDirection, raycastParams)
+    if not raycastResult then return true end
+    return raycastResult.Instance:IsDescendantOf(targetPart.Parent)
+end
+
+local function getBestVisiblePart(character)
+    if not character then return nil end
+    local cam = getCamera()
+    if not cam then return nil end
+
+    local preferredParts = {"Head", "UpperTorso", "Torso", "HumanoidRootPart", "LowerTorso"}
+    for _, partName in ipairs(preferredParts) do
+        local part = character:FindFirstChild(partName)
+        if part and isPartVisible(part) then return part end
+    end
+
+    local bestAlternativePart = nil
+    local shortestDistanceToCenter = math.huge
+    local screenCenter = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+
+    for _, part in ipairs(character:GetChildren()) do
+        if part:IsA("BasePart") and not part.Parent:IsA("Accessory") and not part.Parent:IsA("Hat") and isPartVisible(part) then
+            local screenPos, onScreen = cam:WorldToViewportPoint(part.Position)
+            if onScreen then
+                local distanceToCenter = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                if distanceToCenter < shortestDistanceToCenter then
+                    shortestDistanceToCenter = distanceToCenter
+                    bestAlternativePart = part
+                end
+            end
+        end
+    end
+    return bestAlternativePart
+end
+
+local function getPredictedTargetPosition(targetPlayer, targetPart, dt)
+    if not targetPlayer or not targetPart then return nil end
+    local cam = getCamera()
+    if not cam then return nil end
+    local hrp = targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return targetPart.Position end
+
+    local currentPosition = targetPart.Position
+    local currentVelocity = hrp.AssemblyLinearVelocity
+    local distance = (currentPosition - cam.CFrame.Position).Magnitude
+    local timeToReach = distance / BulletSpeed
+    local previousVelocity = lastVelocities[targetPlayer] or currentVelocity
+    local safeDeltaTime = math.max(dt, 0.0001)
+
+    local acceleration = (currentVelocity - previousVelocity) / safeDeltaTime
+    lastVelocities[targetPlayer] = currentVelocity
+    return currentPosition + (currentVelocity * timeToReach) + (0.5 * acceleration * (timeToReach ^ 2))
+end
+
+local function getClosestPlayer()
+    local cam = getCamera()
+    if not cam then return nil, nil end
+    local closestTarget = nil
+    local shortestDistance = FOV_Radius
+    local screenCenter = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidTarget(player) and player.Character then
+            local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+            local hrp = player.Character:FindFirstChild("HumanoidRootPart") or player.Character:FindFirstChild("Torso")
+            if humanoid and humanoid.Health > 0 and hrp then
+                local screenPos, onScreen = cam:WorldToViewportPoint(hrp.Position)
+                if onScreen then
+                    local distanceFromCenter = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                    if distanceFromCenter < shortestDistance then
+                        closestTarget = player
+                        shortestDistance = distanceFromCenter
+                    end
+                end
+            end
+        end
+    end
+
+    if closestTarget then
+        local targetPart = getBestVisiblePart(closestTarget.Character)
+        if targetPart then return closestTarget, targetPart end
+    end
+    return nil, nil
+end
+
+-- ============================================================
+-- [ ✅ حلقة الأيم بوت من سكربت 1 (تتبع مباشر + تصويب) ]
+-- ============================================================
+RunService.Heartbeat:Connect(function(dt)
+    if not AimbotEnabled then return end
+    local targetPlayer, targetPart = getClosestPlayer()
+    if targetPlayer and targetPart then
+        local finalTargetPos = getPredictedTargetPosition(targetPlayer, targetPart, dt)
+        if finalTargetPos then
+            local cam = getCamera()
+            if cam then
+                cam.CFrame = cam.CFrame:Lerp(CFrame.new(cam.CFrame.Position, finalTargetPos), Smoothness)
+            end
+        end
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    lastVelocities[player] = nil
+end)
+
+-- ============================================================
+-- [ FOV RENDERER — بدون Drawing، GUI دائم ]
+-- ============================================================
+local FOVRenderer = {}
+local fovGui = nil
+local RING_IMAGE = "rbxassetid://5028857084"
+
+local function buildGuiFOV()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local l = Instance.new("ImageLabel")
+    l.Name = "FOV_Circle"
+    l.BackgroundTransparency = 1
+    l.Image = RING_IMAGE
+    l.ImageColor3 = Color3.fromRGB(0, 255, 150)
+    l.ImageTransparency = 0.15
+    l.ZIndex = 0
+    l.Parent = pg
+    return l
+end
+
+function FOVRenderer.init()
+    fovGui = buildGuiFOV()
+end
+
+function FOVRenderer.update()
+    if not fovGui then return end
+    local r = FOV_Radius
+    fovGui.Size = UDim2.new(0, r * 2, 0, r * 2)
+    fovGui.Position = UDim2.new(0.5, -r, 0.5, -r)
+    fovGui.Visible = AimbotEnabled
+end
+
+function FOVRenderer.destroy()
+    if fovGui then pcall(function() fovGui:Destroy() end); fovGui = nil end
+end
+
+-- ============================================================
+-- [ ESP — Bounding Box Projection ]
+-- ============================================================
+local ESP = {}
+ESP.active = {}
+
+local BOX_CORNERS = {
+    Vector3.new(-0.5,-0.5,-0.5), Vector3.new( 0.5,-0.5,-0.5),
+    Vector3.new(-0.5, 0.5,-0.5), Vector3.new( 0.5, 0.5,-0.5),
+    Vector3.new(-0.5,-0.5, 0.5), Vector3.new( 0.5,-0.5, 0.5),
+    Vector3.new(-0.5, 0.5, 0.5), Vector3.new( 0.5, 0.5, 0.5),
+}
+
+local function getBoundingBox(character)
+    local ok, cf, size = pcall(function() return character:GetBoundingBox() end)
+    if ok and cf and size then return cf, size end
+    return nil, nil
+end
+
+local function projectBox(character, cam)
+    local cf, size = getBoundingBox(character)
+    if not cf or not size then return nil end
+
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local anyOnScreen = false
+
+    for _, c in ipairs(BOX_CORNERS) do
+        local world = cf:PointToWorldSpace(c * size)
+        local sp, onScreen = cam:WorldToViewportPoint(world)
+        if onScreen and sp.Z > 0 then
+            anyOnScreen = true
+            if sp.X < minX then minX = sp.X end
+            if sp.Y < minY then minY = sp.Y end
+            if sp.X > maxX then maxX = sp.X end
+            if sp.Y > maxY then maxY = sp.Y end
+        end
+    end
+
+    if not anyOnScreen then return nil end
+    return minX, minY, maxX, maxY
+end
+
+local function buildESP()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ESP_Layer"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame", gui)
+    frame.BackgroundTransparency = 1
+
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Thickness = 1.5
+    stroke.Color = Color3.fromRGB(255, 50, 50)
+
+    local distLabel = Instance.new("TextLabel", gui)
+    distLabel.BackgroundTransparency = 1
+    distLabel.TextColor3 = Color3.fromRGB(255,255,255)
+    distLabel.TextStrokeTransparency = 0
+    distLabel.Font = Enum.Font.GothamBold
+    distLabel.TextSize = 11
+    distLabel.Text = "0m"
+
+    return gui, frame, stroke, distLabel
+end
+
+local function destroyESP(player)
+    local e = ESP.active[player]
+    if not e then return end
+    if e.conn then e.conn:Disconnect() end
+    if e.gui then e.gui:Destroy() end
+    ESP.active[player] = nil
+end
+
+ESP.destroy = destroyESP
+
+function ESP.create(player)
+    if ESP.active[player] then return end
+    if not Config.ESPEnabled then return end
+
+    local gui, frame, stroke, distLabel = buildESP()
+
+    local conn = RunService.RenderStepped:Connect(function()
+        if not Config.ESPEnabled then
+            gui.Enabled = false
+            return
+        end
+        gui.Enabled = true
+
+        if not player.Parent then destroyESP(player); return end
+        if not isValidTarget(player) then destroyESP(player); return end
+
+        local char = player.Character
+        local myChar = LocalPlayer.Character
+        if not char or not myChar then
+            frame.Visible = false; distLabel.Visible = false; return
+        end
+
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        local myHrp = myChar:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not myHrp or not hum or hum.Health <= 0 then
+            frame.Visible = false; distLabel.Visible = false; return
+        end
+
+        local cam = getCamera()
+        if not cam then return end
+
+        local minX, minY, maxX, maxY = projectBox(char, cam)
+        if not minX then
+            frame.Visible = false; distLabel.Visible = false; return
+        end
+
+        frame.Visible = true
+        frame.Position = UDim2.new(0, minX, 0, minY)
+        frame.Size     = UDim2.new(0, maxX - minX, 0, maxY - minY)
+
+        distLabel.Visible = true
+        distLabel.Position = UDim2.new(0, minX, 0, maxY + 2)
+        distLabel.Size     = UDim2.new(0, maxX - minX, 0, 14)
+
+        local d = math.floor((hrp.Position - myHrp.Position).Magnitude)
+        distLabel.Text = d .. "m"
+
+        local head = char:FindFirstChild("Head")
+        if head and isPartVisible(head) then
+            stroke.Color = Color3.fromRGB(0, 255, 100)
+        else
+            stroke.Color = Color3.fromRGB(255, 50, 50)
+        end
+    end)
+
+    ESP.active[player] = { gui = gui, conn = conn }
+end
+
+function ESP.setEnabled(v)
+    Config.ESPEnabled = v
+    for _, e in pairs(ESP.active) do
+        if e.gui then e.gui.Enabled = v end
+    end
+    if v then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and isValidTarget(p) then ESP.create(p) end
+        end
+    end
+end
+
+-- ============================================================
+-- [ WIRING ]
+-- ============================================================
+local function onPlayerAdded(p)
+    if p == LocalPlayer then return end
+    if isValidTarget(p) then ESP.create(p) end
+    local c = p.CharacterAdded:Connect(function()
+        task.wait(0.25)
+        if Config.ESPEnabled and isValidTarget(p) then ESP.create(p) end
+    end)
+    PlayerRegistry.track(p, c)
+end
+
+local function onPlayerRemoving(p)
+    ESP.destroy(p)
+    lastVelocities[p] = nil
+    PlayerRegistry.clear(p)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do onPlayerAdded(p) end
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(onPlayerRemoving)
+
+-- ============================================================
+-- [ MAIN LOOP — FOV ]
+-- ============================================================
+FOVRenderer.init()
+
+RunService.RenderStepped:Connect(function()
+    FOVRenderer.update()
+end)
+
+-- ============================================================
+-- [ CLEANUP ]
+-- ============================================================
+LocalPlayer.AncestryChanged:Connect(function()
+    if not LocalPlayer:IsDescendantOf(game) then
+        FOVRenderer.destroy()
+        for p in pairs(ESP.active) do ESP.destroy(p) end
+        for p in pairs(PlayerRegistry) do PlayerRegistry.clear(p) end
+    end
+end)
